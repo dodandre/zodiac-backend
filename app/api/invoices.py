@@ -25,6 +25,7 @@ from ..schemas.invoice import InvoiceProcessingResponse, ErrorDetail, Processing
 from ..api.api_key_auth import get_api_user_optional, get_client_ip, get_api_user
 from ..api.auth import get_current_user, get_current_user_optional
 import re
+from.utils import extract_invoice_info
 
 router = APIRouter(prefix="/invoices", tags=["invoice-processing"])
 client = OpenAI(api_key=os.getenv('OPEN_AI_KEY'))
@@ -2635,13 +2636,11 @@ def get_successful_invoices(
         ORDER BY uploaded_at DESC 
         LIMIT :limit OFFSET :offset
         """
-        result = db.execute(text(query), {
-            "user_id": current_user.id,
-            "limit": limit,
-            "offset": skip
-        }).fetchall()
+        result = db.execute(
+            text(query),
+            {"user_id": current_user.id, "limit": limit, "offset": skip}
+        ).fetchall()
         
-        # Convert to model instances
         invoices = []
         for row in result:
             invoice = SuccessModel(
@@ -2657,18 +2656,39 @@ def get_successful_invoices(
                 edi_convert_message=row.edi_convert_message,
                 processing_steps_error=row.processing_steps_error,
                 blob_xml_path=row.blob_xml_path,
-                blob_edi_path=row.blob_edi_path
+                blob_edi_path=row.blob_edi_path,
             )
-            
-            # Add computed fields after model creation
-            invoice.xml_content = ""  # Successful invoices don't need content in list view
-            invoice.edi_content = ""  # Successful invoices don't need content in list view
-            invoices.append(invoice)
-        
+
+            # Default empty contents
+            invoice.xml_content = ""
+            invoice.edi_content = ""
+            invoice.info = {}
+            data = vars(invoice).copy()
+            data.pop("_sa_instance_state", None)
+
+            # Safely extract and merge invoice info
+            try:
+                info = extract_invoice_info(row.blob_edi_path)
+                invoice.info = info
+
+                invoice.edi_content = info or {}
+                if isinstance(info, dict):
+                    data.update(info)
+
+            except Exception as info_err:
+                logger.warning(
+                    f"⚠️ Failed to extract invoice info for {row.tracking_id}: {info_err}"
+                )
+            invoices.append(data)
+
         return invoices
+
     except Exception as e:
         logger.error(f"❌ Error getting successful invoices: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting successful invoices: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting successful invoices: {str(e)}"
+        )
 
 @router.get("/failed", response_model=list[ZodiacInvoiceFailedEdi])
 async def get_failed_invoices(
